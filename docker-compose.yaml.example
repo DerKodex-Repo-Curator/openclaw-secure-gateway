@@ -1,0 +1,21 @@
+services:
+  gpg-approval-bot:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: gpg-approval-bot:local
+    env_file:
+      - .env
+    environment:
+      APPROVAL_DIR: /approvals
+      HOME: /home/bot
+      GNUPGHOME: /home/bot/.gnupg
+      SSH_AUTH_SOCK: /home/bot/.gnupg/S.gpg-agent.ssh
+    volumes:
+      - ./approvals:/approvals
+      - ${OPENCLAW_GNUPG_DIR:-/home/your-user/.gnupg}:/home/bot/.gnupg
+      - ${OPENCLAW_GPG_AGENT_DIR:-/run/user/1000/gnupg}/S.gpg-agent:/home/bot/.gnupg/S.gpg-agent
+      - ${OPENCLAW_GPG_AGENT_DIR:-/run/user/1000/gnupg}/S.gpg-agent.extra:/home/bot/.gnupg/S.gpg-agent.extra
+      - ${OPENCLAW_GPG_AGENT_DIR:-/run/user/1000/gnupg}/S.gpg-agent.browser:/home/bot/.gnupg/S.gpg-agent.browser
+      - ${OPENCLAW_GPG_AGENT_DIR:-/run/user/1000/gnupg}/S.gpg-agent.ssh:/home/bot/.gnupg/S.gpg-agent.ssh
+    restart: unless-stopped

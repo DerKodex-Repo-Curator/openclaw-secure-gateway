@@ -1,0 +1,67 @@
+#!/usr/bin/env sh
+set -eu
+
+BOT_TOKEN="${GPG_APPROVAL_BOT_TOKEN:-}"
+CHAT_ID="${GPG_APPROVAL_CHAT_ID:-}"
+APPROVAL_DIR="${APPROVAL_DIR:-/approvals}"
+TIMEOUT="${GPG_APPROVAL_TIMEOUT:-60}"
+LOG_FILE="${APPROVAL_DIR}/ssh-ask.log"
+
+if [ -z "$BOT_TOKEN" ] || [ -z "$CHAT_ID" ]; then
+  echo "[ssh-ask] 缺少独立的 GPG_APPROVAL_BOT_TOKEN 或 GPG_APPROVAL_CHAT_ID" >&2
+  exit 1
+fi
+
+mkdir -p "$APPROVAL_DIR"
+
+log() {
+  ts="$(date '+%Y-%m-%d %H:%M:%S')"
+  line="[ssh-ask] ${ts} $*"
+  echo "$line" >&2
+  echo "$line" >> "$LOG_FILE"
+}
+
+REQUEST_ID="ssh-$(cat /proc/sys/kernel/random/uuid | cut -d'-' -f1)"
+RESPONSE_FILE="${APPROVAL_DIR}/${REQUEST_ID}"
+CMD_DISPLAY="ssh $*"
+CMD_DISPLAY_MD="$(printf '%s' "$CMD_DISPLAY" | sed 's/`/\\`/g')"
+
+SEND_RESP="$(curl -sS -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
+  -H "Content-Type: application/json" \
+  -d "{\"chat_id\":\"${CHAT_ID}\",\"parse_mode\":\"Markdown\",\"text\":\"🔐 SSH 调用审批\\n\\n调用信息: \\\`${CMD_DISPLAY_MD}\\\`\\n\\n请在 ${TIMEOUT} 秒内审批\",\"reply_markup\":{\"inline_keyboard\":[[{\"text\":\"✅ 允许\",\"callback_data\":\"approve:${REQUEST_ID}\"},{\"text\":\"❌ 拒绝\",\"callback_data\":\"deny:${REQUEST_ID}\"}]]}}")"
+MESSAGE_ID="$(printf '%s' "$SEND_RESP" | sed -n 's/.*"message_id":\([0-9][0-9]*\).*/\1/p' | head -n 1)"
+log "request_id=${REQUEST_ID} sendMessage response=${SEND_RESP}"
+
+if [ -z "$MESSAGE_ID" ]; then
+  log "request_id=${REQUEST_ID} 未解析到 message_id，直接拒绝"
+  exit 1
+fi
+
+update_status() {
+  status="$1"
+  curl -sS -X POST "https://api.telegram.org/bot${BOT_TOKEN}/editMessageText" \
+    -H "Content-Type: application/json" \
+    -d "{\"chat_id\":\"${CHAT_ID}\",\"message_id\":${MESSAGE_ID},\"parse_mode\":\"Markdown\",\"text\":\"🔐 SSH 调用审批\\n\\n调用信息: \\\`${CMD_DISPLAY_MD}\\\`\\n\\n${status}\"}" >/dev/null || true
+}
+
+i=0
+while [ "$i" -lt "$TIMEOUT" ]; do
+  if [ -f "$RESPONSE_FILE" ]; then
+    RESPONSE="$(cat "$RESPONSE_FILE")"
+    rm -f "$RESPONSE_FILE"
+    log "request_id=${REQUEST_ID} 收到审批结果=${RESPONSE}"
+    if [ "$RESPONSE" = "approve" ]; then
+      update_status "✅ 已批准"
+      exec /usr/bin/ssh "$@"
+    fi
+    update_status "❌ 已拒绝"
+    exit 1
+  fi
+  i=$((i + 1))
+  sleep 1
+done
+
+log "request_id=${REQUEST_ID} 审批超时"
+update_status "⏱️ 超时失败（未审批）"
+exit 1
+
