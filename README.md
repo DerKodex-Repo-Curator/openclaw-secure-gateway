@@ -27,34 +27,34 @@
 ## 独立启动
 ```bash
 cp .env.example .env
+# 在 .env 里填写 HOST_APPROVAL_DIR / HOST_GNUPG_DIR / HOST_GPG_AGENT_DIR
 cp docker-compose.yaml.example docker-compose.yaml
 docker compose up -d --build
 ```
 
 ## 其他 Docker 容器如何使用
 核心思路：
-- 把本目录的 `scripts/gpg-ask`、`scripts/ssh-ask` 挂载到目标容器覆盖 `/usr/local/bin/gpg`、`/usr/local/bin/ssh`
-- 共享审批目录（例如 `/approvals`）
-- 共享宿主机 `.gnupg` 与 gpg-agent sockets
+- 把本目录 `scripts/gpg-ask`、`scripts/ssh-ask` 挂载到目标容器覆盖 `/usr/local/bin/gpg`、`/usr/local/bin/ssh`
+- 共享审批目录
+- 共享 `.gnupg` 与 gpg-agent sockets
 
 在你的 compose 里可直接加：
 
 ```yaml
 services:
   your-app:
-    # ... 你的镜像/构建配置
     environment:
-      APPROVAL_DIR: /approvals
-      SSH_AUTH_SOCK: /home/node/.gnupg/S.gpg-agent.ssh
+      APPROVAL_DIR: ${BOT_APPROVAL_DIR}
+      SSH_AUTH_SOCK: ${BOT_SSH_AUTH_SOCK}
     volumes:
-      - /absolute/path/to/gpg-approval-bot/scripts/gpg-ask:/usr/local/bin/gpg:ro
-      - /absolute/path/to/gpg-approval-bot/scripts/ssh-ask:/usr/local/bin/ssh:ro
-      - /absolute/path/to/approvals:/approvals
-      - /home/your-user/.gnupg:/home/node/.gnupg
-      - /run/user/1000/gnupg/S.gpg-agent:/home/node/.gnupg/S.gpg-agent
-      - /run/user/1000/gnupg/S.gpg-agent.extra:/home/node/.gnupg/S.gpg-agent.extra
-      - /run/user/1000/gnupg/S.gpg-agent.browser:/home/node/.gnupg/S.gpg-agent.browser
-      - /run/user/1000/gnupg/S.gpg-agent.ssh:/home/node/.gnupg/S.gpg-agent.ssh
+      - ${BOT_SCRIPT_DIR}/gpg-ask:/usr/local/bin/gpg:ro
+      - ${BOT_SCRIPT_DIR}/ssh-ask:/usr/local/bin/ssh:ro
+      - ${HOST_APPROVAL_DIR}:${BOT_APPROVAL_DIR}
+      - ${HOST_GNUPG_DIR}:${BOT_GNUPG_DIR}
+      - ${HOST_GPG_AGENT_DIR}/S.gpg-agent:${BOT_GNUPG_DIR}/S.gpg-agent
+      - ${HOST_GPG_AGENT_DIR}/S.gpg-agent.extra:${BOT_GNUPG_DIR}/S.gpg-agent.extra
+      - ${HOST_GPG_AGENT_DIR}/S.gpg-agent.browser:${BOT_GNUPG_DIR}/S.gpg-agent.browser
+      - ${HOST_GPG_AGENT_DIR}/S.gpg-agent.ssh:${BOT_GNUPG_DIR}/S.gpg-agent.ssh
 ```
 
 ## 安全约束

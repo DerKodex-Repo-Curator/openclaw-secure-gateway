@@ -3,19 +3,19 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    image: gpg-approval-bot:local
+    image: ${BOT_IMAGE_NAME}
     env_file:
       - .env
     environment:
-      APPROVAL_DIR: /approvals
-      HOME: /home/bot
-      GNUPGHOME: /home/bot/.gnupg
-      SSH_AUTH_SOCK: /home/bot/.gnupg/S.gpg-agent.ssh
+      APPROVAL_SOCKET: ${BOT_APPROVAL_SOCKET}
+      HOME: ${BOT_HOME_DIR}
+      GNUPGHOME: ${BOT_GNUPG_DIR}
+      SSH_AUTH_SOCK: ${BOT_SSH_AUTH_SOCK}
     volumes:
-      - ./approvals:/approvals
-      - ${OPENCLAW_GNUPG_DIR:-/home/your-user/.gnupg}:/home/bot/.gnupg
-      - ${OPENCLAW_GPG_AGENT_DIR:-/run/user/1000/gnupg}/S.gpg-agent:/home/bot/.gnupg/S.gpg-agent
-      - ${OPENCLAW_GPG_AGENT_DIR:-/run/user/1000/gnupg}/S.gpg-agent.extra:/home/bot/.gnupg/S.gpg-agent.extra
-      - ${OPENCLAW_GPG_AGENT_DIR:-/run/user/1000/gnupg}/S.gpg-agent.browser:/home/bot/.gnupg/S.gpg-agent.browser
-      - ${OPENCLAW_GPG_AGENT_DIR:-/run/user/1000/gnupg}/S.gpg-agent.ssh:/home/bot/.gnupg/S.gpg-agent.ssh
+      - ${HOST_APPROVAL_RPC_DIR}:${BOT_APPROVAL_RPC_DIR}
+      - ${HOST_GNUPG_DIR}:${BOT_GNUPG_DIR}
+      - ${HOST_GPG_AGENT_DIR}/S.gpg-agent:${BOT_GNUPG_DIR}/S.gpg-agent
+      - ${HOST_GPG_AGENT_DIR}/S.gpg-agent.extra:${BOT_GNUPG_DIR}/S.gpg-agent.extra
+      - ${HOST_GPG_AGENT_DIR}/S.gpg-agent.browser:${BOT_GNUPG_DIR}/S.gpg-agent.browser
+      - ${HOST_GPG_AGENT_DIR}/S.gpg-agent.ssh:${BOT_GNUPG_DIR}/S.gpg-agent.ssh
     restart: unless-stopped

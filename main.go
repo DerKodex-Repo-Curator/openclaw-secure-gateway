@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/exec"
@@ -14,6 +15,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -44,14 +46,6 @@ type TGMessage struct {
 	} `json:"chat"`
 }
 
-type UnlockRequest struct {
-	RequestID string `json:"request_id"`
-	Cmd       string `json:"cmd"`
-	KeyHint   string `json:"key_hint"`
-	CreatedAt int64  `json:"created_at"`
-	MessageID int64  `json:"message_id"`
-}
-
 type tgSendMessageResp struct {
 	OK     bool `json:"ok"`
 	Result struct {
@@ -59,33 +53,123 @@ type tgSendMessageResp struct {
 	} `json:"result"`
 }
 
+type rpcRequestBody struct {
+	Kind          string `json:"kind"`
+	Cmd           string `json:"cmd"`
+	TimeoutSecond int    `json:"timeout_seconds"`
+	KeyHint       string `json:"key_hint,omitempty"`
+}
+
+type rpcWaitBody struct {
+	RequestID     string `json:"request_id"`
+	TimeoutSecond int    `json:"timeout_seconds"`
+}
+
+type approvalReq struct {
+	ID        string
+	Kind      string // gpg | ssh
+	Cmd       string
+	KeyHint   string
+	CreatedAt time.Time
+	Deadline  time.Time
+	MessageID int64
+	PromptID  int64
+
+	mu        sync.Mutex
+	state     string // waiting_approval | waiting_password | approved | denied | timeout
+	done      chan string
+	finalized bool
+}
+
+type approvalManager struct {
+	mu       sync.RWMutex
+	requests map[string]*approvalReq
+}
+
+func newManager() *approvalManager {
+	return &approvalManager{requests: make(map[string]*approvalReq)}
+}
+
+func (m *approvalManager) add(r *approvalReq) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.requests[r.ID] = r
+}
+
+func (m *approvalManager) get(id string) (*approvalReq, bool) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	r, ok := m.requests[id]
+	return r, ok
+}
+
+func (m *approvalManager) latestPendingPassword() *approvalReq {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	list := make([]*approvalReq, 0)
+	for _, r := range m.requests {
+		r.mu.Lock()
+		st := r.state
+		r.mu.Unlock()
+		if st == "waiting_password" {
+			list = append(list, r)
+		}
+	}
+	if len(list) == 0 {
+		return nil
+	}
+	sort.Slice(list, func(i, j int) bool {
+		return list[i].CreatedAt.After(list[j].CreatedAt)
+	})
+	return list[0]
+}
+
+func (r *approvalReq) transition(to string) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.finalized {
+		return false
+	}
+	r.state = to
+	if to == "approved" || to == "denied" || to == "timeout" {
+		r.finalized = true
+		select {
+		case r.done <- to:
+		default:
+		}
+		close(r.done)
+	}
+	return true
+}
+
 func main() {
 	token := strings.TrimSpace(os.Getenv("GPG_APPROVAL_BOT_TOKEN"))
 	chatIDStr := strings.TrimSpace(os.Getenv("GPG_APPROVAL_CHAT_ID"))
-	approvalDir := strings.TrimSpace(os.Getenv("APPROVAL_DIR"))
-	if approvalDir == "" {
-		approvalDir = "/approvals"
+	socketPath := strings.TrimSpace(os.Getenv("APPROVAL_SOCKET"))
+	if socketPath == "" {
+		socketPath = "/run/approval-rpc/approval.sock"
 	}
 	if token == "" || chatIDStr == "" {
-		log.Fatal("缺少独立的 GPG_APPROVAL_BOT_TOKEN 或 GPG_APPROVAL_CHAT_ID")
+		log.Fatal("缺少 GPG_APPROVAL_BOT_TOKEN 或 GPG_APPROVAL_CHAT_ID")
 	}
 	allowedChatID, err := strconv.ParseInt(chatIDStr, 10, 64)
 	if err != nil {
 		log.Fatalf("GPG_APPROVAL_CHAT_ID 非法: %v", err)
 	}
-	if err := os.MkdirAll(approvalDir, 0o700); err != nil {
-		log.Fatalf("创建审批目录失败: %v", err)
+
+	if err := os.MkdirAll(filepath.Dir(socketPath), 0o700); err != nil {
+		log.Fatalf("创建 socket 目录失败: %v", err)
 	}
+	_ = os.Remove(socketPath)
 
 	baseURL := "https://api.telegram.org/bot" + token
+	mgr := newManager()
+
+	go runRPCServer(socketPath, baseURL, allowedChatID, mgr)
+	log.Printf("gpg-approval-bot 启动，socket=%s", socketPath)
+
 	offset := int64(0)
-	log.Printf("gpg-approval-bot 启动，审批目录=%s", approvalDir)
-
 	for {
-		if err := promptPendingUnlockRequests(baseURL, allowedChatID, approvalDir); err != nil {
-			log.Printf("扫描解锁请求失败: %v", err)
-		}
-
 		updates, nextOffset, err := getUpdates(baseURL, offset)
 		if err != nil {
 			log.Printf("getUpdates 失败: %v", err)
@@ -95,12 +179,12 @@ func main() {
 		offset = nextOffset
 		for _, upd := range updates {
 			if upd.CallbackQuery != nil {
-				if err := handleCallback(baseURL, upd.CallbackQuery, allowedChatID, approvalDir); err != nil {
+				if err := handleCallback(baseURL, upd.CallbackQuery, allowedChatID, mgr); err != nil {
 					log.Printf("处理回调失败: %v", err)
 				}
 			}
 			if upd.Message != nil {
-				if err := handleMessage(baseURL, upd.Message, allowedChatID, approvalDir); err != nil {
+				if err := handleMessage(baseURL, upd.Message, allowedChatID, mgr); err != nil {
 					log.Printf("处理消息失败: %v", err)
 				}
 			}
@@ -108,37 +192,176 @@ func main() {
 	}
 }
 
-func getUpdates(baseURL string, offset int64) ([]Update, int64, error) {
-	url := fmt.Sprintf("%s/getUpdates?timeout=25&offset=%d", baseURL, offset)
-	resp, err := http.Get(url)
-	if err != nil {
-		return nil, offset, err
-	}
-	defer resp.Body.Close()
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, offset, err
-	}
-	if resp.StatusCode != http.StatusOK {
-		return nil, offset, fmt.Errorf("getUpdates 状态码=%d body=%s", resp.StatusCode, string(body))
-	}
-	var parsed UpdateResponse
-	if err := json.Unmarshal(body, &parsed); err != nil {
-		return nil, offset, err
-	}
-	if !parsed.OK {
-		return nil, offset, errors.New("Telegram 返回 ok=false")
-	}
-	next := offset
-	for _, u := range parsed.Result {
-		if u.UpdateID >= next {
-			next = u.UpdateID + 1
+func runRPCServer(socketPath, baseURL string, allowedChatID int64, mgr *approvalManager) {
+	mux := http.NewServeMux()
+
+	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("ok"))
+	})
+
+	mux.HandleFunc("/v1/request", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
 		}
+		var body rpcRequestBody
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			http.Error(w, "bad json", http.StatusBadRequest)
+			return
+		}
+		kind := strings.TrimSpace(body.Kind)
+		if kind != "gpg" && kind != "ssh" {
+			http.Error(w, "kind must be gpg or ssh", http.StatusBadRequest)
+			return
+		}
+		cmd := strings.TrimSpace(body.Cmd)
+		if cmd == "" {
+			http.Error(w, "cmd required", http.StatusBadRequest)
+			return
+		}
+		timeout := body.TimeoutSecond
+		if timeout <= 0 {
+			timeout = 60
+		}
+
+		reqID := shortID(kind)
+		req := &approvalReq{
+			ID:        reqID,
+			Kind:      kind,
+			Cmd:       cmd,
+			KeyHint:   strings.TrimSpace(body.KeyHint),
+			CreatedAt: time.Now(),
+			Deadline:  time.Now().Add(time.Duration(timeout) * time.Second),
+			state:     "waiting_approval",
+			done:      make(chan string, 1),
+		}
+
+		msgID, err := sendApprovalMessage(baseURL, allowedChatID, req, timeout)
+		if err != nil {
+			http.Error(w, "send telegram failed", http.StatusBadGateway)
+			log.Printf("发送审批消息失败: %v", err)
+			return
+		}
+		req.MessageID = msgID
+		mgr.add(req)
+		log.Printf("创建审批请求 id=%s kind=%s", req.ID, req.Kind)
+
+		go func(rq *approvalReq, t int) {
+			<-time.After(time.Duration(t) * time.Second)
+			rq.mu.Lock()
+			state := rq.state
+			rq.mu.Unlock()
+			if state == "waiting_approval" || state == "waiting_password" {
+				if rq.transition("timeout") {
+					status := "⏱️ 超时失败（未审批）"
+					if state == "waiting_password" {
+						status = "⏱️ 超时失败（未输入密码）"
+						_ = editPendingPromptMessage(baseURL, allowedChatID, rq, "⏱️ 超时失败（未输入密码）")
+					}
+					_ = editStatusMessage(baseURL, allowedChatID, rq.MessageID, rq.Cmd, status)
+				}
+			}
+		}(req, timeout)
+
+		writeJSON(w, map[string]any{"request_id": reqID})
+	})
+
+	mux.HandleFunc("/v1/wait", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		var body rpcWaitBody
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			http.Error(w, "bad json", http.StatusBadRequest)
+			return
+		}
+		reqID := strings.TrimSpace(body.RequestID)
+		if reqID == "" {
+			http.Error(w, "request_id required", http.StatusBadRequest)
+			return
+		}
+		req, ok := mgr.get(reqID)
+		if !ok {
+			http.Error(w, "not found", http.StatusNotFound)
+			return
+		}
+		waitSec := body.TimeoutSecond
+		if waitSec <= 0 {
+			waitSec = 90
+		}
+
+		req.mu.Lock()
+		st := req.state
+		req.mu.Unlock()
+		if st == "approved" || st == "denied" || st == "timeout" {
+			writeJSON(w, map[string]any{"status": st})
+			return
+		}
+
+		select {
+		case st, ok := <-req.done:
+			if !ok {
+				req.mu.Lock()
+				st = req.state
+				req.mu.Unlock()
+			}
+			writeJSON(w, map[string]any{"status": st})
+		case <-time.After(time.Duration(waitSec) * time.Second):
+			writeJSON(w, map[string]any{"status": "wait_timeout"})
+		}
+	})
+
+	server := &http.Server{Handler: mux}
+	ln, err := net.Listen("unix", socketPath)
+	if err != nil {
+		log.Fatalf("监听 unix socket 失败: %v", err)
 	}
-	return parsed.Result, next, nil
+	_ = os.Chmod(socketPath, 0o660)
+	if err := server.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		log.Fatalf("rpc server 退出: %v", err)
+	}
 }
 
-func handleCallback(baseURL string, cb *CallbackQuery, allowedChatID int64, approvalDir string) error {
+func sendApprovalMessage(baseURL string, chatID int64, req *approvalReq, timeout int) (int64, error) {
+	emoji := "🔑"
+	title := "GPG"
+	if req.Kind == "ssh" {
+		emoji = "🔐"
+		title = "SSH"
+	}
+	cmdMD := strings.ReplaceAll(req.Cmd, "`", "\\`")
+	text := fmt.Sprintf("%s %s 调用审批\n\n调用信息: `%s`\n\n请在 %d 秒内审批", emoji, title, cmdMD, timeout)
+	cbApprove := fmt.Sprintf("approve:%s", req.ID)
+	cbDeny := fmt.Sprintf("deny:%s", req.ID)
+	respBody, err := postJSONRead(baseURL+"/sendMessage", map[string]any{
+		"chat_id":    chatID,
+		"parse_mode": "Markdown",
+		"text":       text,
+		"reply_markup": map[string]any{
+			"inline_keyboard": []any{
+				[]any{
+					map[string]any{"text": "✅ 允许", "callback_data": cbApprove},
+					map[string]any{"text": "❌ 拒绝", "callback_data": cbDeny},
+				},
+			},
+		},
+	})
+	if err != nil {
+		return 0, err
+	}
+	var parsed tgSendMessageResp
+	if err := json.Unmarshal(respBody, &parsed); err != nil {
+		return 0, err
+	}
+	if !parsed.OK || parsed.Result.MessageID == 0 {
+		return 0, errors.New("sendMessage 未返回有效 message_id")
+	}
+	return parsed.Result.MessageID, nil
+}
+
+func handleCallback(baseURL string, cb *CallbackQuery, allowedChatID int64, mgr *approvalManager) error {
 	if cb.Message == nil {
 		return errors.New("callback message 为空")
 	}
@@ -155,144 +378,118 @@ func handleCallback(baseURL string, cb *CallbackQuery, allowedChatID int64, appr
 		return fmt.Errorf("callback_data 非法: %s", cb.Data)
 	}
 	action, requestID := parts[0], parts[1]
-	if action != "approve" && action != "deny" {
+	req, ok := mgr.get(requestID)
+	if !ok {
+		_ = postJSON(baseURL+"/answerCallbackQuery", map[string]any{
+			"callback_query_id": cb.ID,
+			"text":              "请求不存在或已过期",
+		})
+		return nil
+	}
+
+	if action == "deny" {
+		if req.transition("denied") {
+			_ = editStatusMessage(baseURL, allowedChatID, req.MessageID, req.Cmd, "❌ 已拒绝")
+		}
+		_ = postJSON(baseURL+"/answerCallbackQuery", map[string]any{"callback_query_id": cb.ID, "text": "❌ 已拒绝"})
+		return nil
+	}
+	if action != "approve" {
 		return fmt.Errorf("未知 action: %s", action)
 	}
 
-	respPath := filepath.Join(approvalDir, requestID)
-	if err := os.WriteFile(respPath, []byte(action), 0o600); err != nil {
-		return fmt.Errorf("写审批结果失败: %w", err)
+	if req.Kind == "ssh" {
+		if req.transition("approved") {
+			_ = editStatusMessage(baseURL, allowedChatID, req.MessageID, req.Cmd, "✅ 已批准")
+		}
+		_ = postJSON(baseURL+"/answerCallbackQuery", map[string]any{"callback_query_id": cb.ID, "text": "✅ 已批准"})
+		return nil
 	}
-	log.Printf("callback 已写审批结果 request_id=%s action=%s", requestID, action)
 
-	statusText := "✅ 已允许"
-	statusMark := "✅"
-	statusAction := "已批准"
-	if action == "deny" {
-		statusText = "❌ 已拒绝"
-		statusMark = "❌"
-		statusAction = "已拒绝"
+	req.mu.Lock()
+	if req.finalized {
+		req.mu.Unlock()
+		return nil
 	}
-	_ = postJSON(baseURL+"/answerCallbackQuery", map[string]any{
-		"callback_query_id": cb.ID,
-		"text":              statusText,
-	})
-
-	baseText := extractMessageTop(cb.Message.Text)
-	newText := baseText + "\n\n" + statusMark + " " + statusAction
-	_ = postJSON(baseURL+"/editMessageText", map[string]any{
-		"chat_id":    cb.Message.Chat.ID,
-		"message_id": cb.Message.MessageID,
-		"text":       newText,
-	})
+	req.state = "waiting_password"
+	req.mu.Unlock()
+	status := "🟡 已批准，但需要密码（PENDING）\n请输入密码（发送后自动删除）"
+	if req.KeyHint != "" {
+		status += fmt.Sprintf("\n密钥提示: %s", req.KeyHint)
+	}
+	_ = editStatusMessage(baseURL, allowedChatID, req.MessageID, req.Cmd, status)
+	promptID, err := sendPendingPromptMessage(baseURL, allowedChatID)
+	if err != nil {
+		log.Printf("发送 PENDING 提示失败 request_id=%s err=%v", req.ID, err)
+	} else {
+		req.mu.Lock()
+		req.PromptID = promptID
+		req.mu.Unlock()
+	}
+	_ = postJSON(baseURL+"/answerCallbackQuery", map[string]any{"callback_query_id": cb.ID, "text": "✅ 已批准"})
 	return nil
 }
 
-func handleMessage(baseURL string, msg *TGMessage, allowedChatID int64, approvalDir string) error {
+func handleMessage(baseURL string, msg *TGMessage, allowedChatID int64, mgr *approvalManager) error {
 	if msg.Chat.ID != allowedChatID {
 		return nil
 	}
-	// 中文注释：用户发送的任何消息都立即删除，避免口令或其他内容残留。
-	defer func() {
-		_ = deleteMessage(baseURL, msg.Chat.ID, msg.MessageID)
-	}()
-
-	req, reqPath, sentMarkPath, hasPending, err := findPendingUnlockRequest(approvalDir)
-	if err != nil {
-		return err
-	}
-	if !hasPending {
-		log.Printf("收到文本消息但当前无待解锁请求")
-		return nil
-	}
-	log.Printf("收到文本消息，将作为解锁口令 request_id=%s", req.RequestID)
+	defer func() { _ = deleteMessage(baseURL, msg.Chat.ID, msg.MessageID) }()
 
 	passphrase := msg.Text
 	if strings.TrimSpace(passphrase) == "" {
 		return nil
 	}
 
-	ok, err := unlockKey(passphrase, req.KeyHint)
-	if !ok {
-		// 中文注释：解锁失败时静默等待下一次输入，不写失败结果，允许重试。
-		if err != nil {
-			log.Printf("解锁失败 request_id=%s", req.RequestID)
-		}
+	req := mgr.latestPendingPassword()
+	if req == nil {
 		return nil
 	}
-	log.Printf("解锁成功 request_id=%s", req.RequestID)
 
-	resultPath := filepath.Join(approvalDir, "unlock_"+req.RequestID+".result")
-	if writeErr := os.WriteFile(resultPath, []byte("unlocked"), 0o600); writeErr != nil {
-		return writeErr
-	}
-	// 中文注释：解锁成功后继续编辑原审批消息，不额外发送新消息。
-	_ = req.MessageID
-	_ = os.Remove(reqPath)
-	_ = os.Remove(sentMarkPath)
-	return nil
-}
-
-func promptPendingUnlockRequests(baseURL string, chatID int64, approvalDir string) error {
-	matches, err := filepath.Glob(filepath.Join(approvalDir, "unlock_*.json"))
-	if err != nil {
-		return err
-	}
-	for _, path := range matches {
-		mark := path + ".sent"
-		if _, err := os.Stat(mark); err == nil {
-			continue
-		}
-		b, err := os.ReadFile(path)
+	ok, err := unlockKey(passphrase, req.KeyHint)
+	if !ok {
 		if err != nil {
-			continue
+			log.Printf("解锁失败 request_id=%s err=%v", req.ID, err)
 		}
-		var req UnlockRequest
-		if err := json.Unmarshal(b, &req); err != nil {
-			continue
-		}
-		if req.MessageID <= 0 {
-			log.Printf("跳过 PENDING 更新：message_id 缺失 request_id=%s", req.RequestID)
-			continue
-		}
-		text := buildStateMessage(req.Cmd, "🟡 已批准，但需要密码（PENDING）\n请输入密码（发送后自动删除）")
-		if req.KeyHint != "" {
-			text += fmt.Sprintf("\n密钥提示: %s", req.KeyHint)
-		}
-		if err := postJSON(baseURL+"/editMessageText", map[string]any{
-			"chat_id":    chatID,
-			"message_id": req.MessageID,
-			"parse_mode": "Markdown",
-			"text":       text,
-		}); err != nil {
-			log.Printf("更新 PENDING 失败 request_id=%s", req.RequestID)
-			continue
-		}
-		log.Printf("已更新为 PENDING request_id=%s message_id=%d", req.RequestID, req.MessageID)
-		_ = os.WriteFile(mark, []byte("1"), 0o600)
+		_ = editPendingPromptMessage(baseURL, allowedChatID, req, "❌ 密码验证失败，请重新输入（发送后自动删除）")
+		return nil
 	}
+	if req.transition("approved") {
+		_ = editStatusMessage(baseURL, allowedChatID, req.MessageID, req.Cmd, "✅ 已成功")
+	}
+	_ = deletePendingPromptMessage(baseURL, allowedChatID, req)
+	log.Printf("解锁成功 request_id=%s", req.ID)
 	return nil
 }
 
-func findPendingUnlockRequest(approvalDir string) (UnlockRequest, string, string, bool, error) {
-	matches, err := filepath.Glob(filepath.Join(approvalDir, "unlock_*.json"))
+func getUpdates(baseURL string, offset int64) ([]Update, int64, error) {
+	url := fmt.Sprintf("%s/getUpdates?timeout=25&offset=%d", baseURL, offset)
+	resp, err := http.Get(url)
 	if err != nil {
-		return UnlockRequest{}, "", "", false, err
+		return nil, offset, err
 	}
-	if len(matches) == 0 {
-		return UnlockRequest{}, "", "", false, nil
-	}
-	sort.Strings(matches)
-	reqPath := matches[0]
-	b, err := os.ReadFile(reqPath)
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return UnlockRequest{}, "", "", false, err
+		return nil, offset, err
 	}
-	var req UnlockRequest
-	if err := json.Unmarshal(b, &req); err != nil {
-		return UnlockRequest{}, "", "", false, err
+	if resp.StatusCode != http.StatusOK {
+		return nil, offset, fmt.Errorf("getUpdates 状态码=%d", resp.StatusCode)
 	}
-	return req, reqPath, reqPath + ".sent", true, nil
+	var parsed UpdateResponse
+	if err := json.Unmarshal(body, &parsed); err != nil {
+		return nil, offset, err
+	}
+	if !parsed.OK {
+		return nil, offset, errors.New("Telegram 返回 ok=false")
+	}
+	next := offset
+	for _, u := range parsed.Result {
+		if u.UpdateID >= next {
+			next = u.UpdateID + 1
+		}
+	}
+	return parsed.Result, next, nil
 }
 
 func unlockKey(passphrase, keyHint string) (bool, error) {
@@ -321,6 +518,77 @@ func unlockKey(passphrase, keyHint string) (bool, error) {
 	return true, nil
 }
 
+func editStatusMessage(baseURL string, chatID, messageID int64, cmd, status string) error {
+	esc := strings.ReplaceAll(cmd, "`", "\\`")
+	text := fmt.Sprintf("调用信息: `%s`\n\n%s", esc, status)
+	prefix := "🔑 GPG 调用审批"
+	if strings.HasPrefix(cmd, "ssh ") {
+		prefix = "🔐 SSH 调用审批"
+	}
+	text = prefix + "\n\n" + text
+	return postJSON(baseURL+"/editMessageText", map[string]any{
+		"chat_id":    chatID,
+		"message_id": messageID,
+		"parse_mode": "Markdown",
+		"text":       text,
+	})
+}
+
+func sendPendingPromptMessage(baseURL string, chatID int64) (int64, error) {
+	respBody, err := postJSONRead(baseURL+"/sendMessage", map[string]any{
+		"chat_id":    chatID,
+		"parse_mode": "Markdown",
+		"text":       "🔴 *请输入密码（发送后自动删除）*",
+	})
+	if err != nil {
+		return 0, err
+	}
+	var parsed tgSendMessageResp
+	if err := json.Unmarshal(respBody, &parsed); err != nil {
+		return 0, err
+	}
+	if !parsed.OK || parsed.Result.MessageID == 0 {
+		return 0, errors.New("sendMessage 未返回有效 message_id")
+	}
+	return parsed.Result.MessageID, nil
+}
+
+func editPendingPromptMessage(baseURL string, chatID int64, req *approvalReq, text string) error {
+	req.mu.Lock()
+	messageID := req.PromptID
+	req.mu.Unlock()
+	if messageID <= 0 {
+		return nil
+	}
+	return postJSON(baseURL+"/editMessageText", map[string]any{
+		"chat_id":    chatID,
+		"message_id": messageID,
+		"parse_mode": "Markdown",
+		"text":       "🔴 *" + strings.ReplaceAll(text, "*", "\\*") + "*",
+	})
+}
+
+func deletePendingPromptMessage(baseURL string, chatID int64, req *approvalReq) error {
+	req.mu.Lock()
+	messageID := req.PromptID
+	req.PromptID = 0
+	req.mu.Unlock()
+	if messageID <= 0 {
+		return nil
+	}
+	return deleteMessage(baseURL, chatID, messageID)
+}
+
+func deleteMessage(baseURL string, chatID, messageID int64) error {
+	if messageID <= 0 {
+		return nil
+	}
+	return postJSON(baseURL+"/deleteMessage", map[string]any{
+		"chat_id":    chatID,
+		"message_id": messageID,
+	})
+}
+
 func postJSON(url string, payload map[string]any) error {
 	b, err := json.Marshal(payload)
 	if err != nil {
@@ -336,24 +604,6 @@ func postJSON(url string, payload map[string]any) error {
 		return fmt.Errorf("POST %s 状态码=%d body=%s", url, resp.StatusCode, string(body))
 	}
 	return nil
-}
-
-func sendMessageAndGetID(baseURL string, chatID int64, text string) (int64, error) {
-	respBody, err := postJSONRead(baseURL+"/sendMessage", map[string]any{
-		"chat_id": chatID,
-		"text":    text,
-	})
-	if err != nil {
-		return 0, err
-	}
-	var parsed tgSendMessageResp
-	if err := json.Unmarshal(respBody, &parsed); err != nil {
-		return 0, err
-	}
-	if !parsed.OK || parsed.Result.MessageID == 0 {
-		return 0, errors.New("sendMessage 未返回有效 message_id")
-	}
-	return parsed.Result.MessageID, nil
 }
 
 func postJSONRead(url string, payload map[string]any) ([]byte, error) {
@@ -376,63 +626,19 @@ func postJSONRead(url string, payload map[string]any) ([]byte, error) {
 	return body, nil
 }
 
-func deleteMessage(baseURL string, chatID, messageID int64) error {
-	if messageID <= 0 {
-		return nil
-	}
-	return postJSON(baseURL+"/deleteMessage", map[string]any{
-		"chat_id":    chatID,
-		"message_id": messageID,
-	})
+func writeJSON(w http.ResponseWriter, v map[string]any) {
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(v)
 }
 
-func readPromptMessageID(markPath string) int64 {
-	b, err := os.ReadFile(markPath)
-	if err != nil {
-		return 0
+func shortID(prefix string) string {
+	now := time.Now().UnixNano()
+	id := fmt.Sprintf("%x", now)
+	if len(id) > 8 {
+		id = id[len(id)-8:]
 	}
-	id, err := strconv.ParseInt(strings.TrimSpace(string(b)), 10, 64)
-	if err != nil {
-		return 0
+	if prefix == "ssh" {
+		return "ssh-" + id
 	}
 	return id
-}
-
-func extractMessageTop(text string) string {
-	parts := strings.Split(text, "\n\n请在")
-	base := parts[0]
-	for _, marker := range []string{"\n\n✅ ", "\n\n❌ ", "\n\n🟡 "} {
-		if idx := strings.Index(base, marker); idx >= 0 {
-			base = base[:idx]
-		}
-	}
-	lines := strings.Split(base, "\n")
-	out := make([]string, 0, len(lines))
-	for _, line := range lines {
-		if strings.Contains(line, "请在") || strings.Contains(line, "请输入密码") {
-			continue
-		}
-		out = append(out, line)
-	}
-	return strings.TrimSpace(strings.Join(out, "\n"))
-}
-
-func buildStateMessage(cmd, status string) string {
-	esc := strings.ReplaceAll(cmd, "`", "\\`")
-	top := fmt.Sprintf("🔑 GPG 调用审批\n\n调用信息: `%s`", esc)
-	return top + "\n\n" + status
-}
-
-func formatElapsedFromMessage(messageDate int64) string {
-	if messageDate <= 0 {
-		return "0分0秒"
-	}
-	now := time.Now().Unix()
-	if now < messageDate {
-		return "0分0秒"
-	}
-	elapsed := now - messageDate
-	mins := elapsed / 60
-	secs := elapsed % 60
-	return fmt.Sprintf("%d分%d秒", mins, secs)
 }

@@ -6,146 +6,53 @@ if [ "${1:-}" = "--version" ] || [ "${1:-}" = "--list-keys" ] || [ "${1:-}" = "-
   exec /usr/bin/gpg "$@"
 fi
 
-BOT_TOKEN="${GPG_APPROVAL_BOT_TOKEN:-}"
-CHAT_ID="${GPG_APPROVAL_CHAT_ID:-}"
-APPROVAL_DIR="${APPROVAL_DIR:-/approvals}"
+APPROVAL_SOCKET="${APPROVAL_SOCKET:-/run/approval-rpc/approval.sock}"
 TIMEOUT="${GPG_APPROVAL_TIMEOUT:-60}"
 UNLOCK_KEY_HINT="${GPG_UNLOCK_KEY_HINT:-}"
-LOG_FILE="${APPROVAL_DIR}/gpg-ask.log"
 
-if [ -z "$BOT_TOKEN" ] || [ -z "$CHAT_ID" ]; then
-  echo "[gpg-ask] 缺少独立的 GPG_APPROVAL_BOT_TOKEN 或 GPG_APPROVAL_CHAT_ID" >&2
-  exit 1
-fi
-
-mkdir -p "$APPROVAL_DIR"
-
-log() {
-  ts="$(date '+%Y-%m-%d %H:%M:%S')"
-  line="[gpg-ask] ${ts} $*"
-  echo "$line" >&2
-  echo "$line" >> "$LOG_FILE"
-}
-
-REQUEST_ID="$(cat /proc/sys/kernel/random/uuid | cut -d'-' -f1)"
-RESPONSE_FILE="$APPROVAL_DIR/$REQUEST_ID"
-UNLOCK_REQ_FILE="$APPROVAL_DIR/unlock_${REQUEST_ID}.json"
-UNLOCK_RESULT_FILE="$APPROVAL_DIR/unlock_${REQUEST_ID}.result"
 CMD_DISPLAY="gpg $*"
-START_TS="$(date +%s)"
 
-# 中文注释：避免 JSON 字符串被双引号破坏。
-CMD_DISPLAY_ESCAPED="$(printf '%s' "$CMD_DISPLAY" | sed 's/"/'"'"'/g')"
-# 中文注释：Telegram Markdown 代码块使用反引号，这里转义反引号避免破坏格式。
-CMD_DISPLAY_MD="$(printf '%s' "$CMD_DISPLAY" | sed 's/`/\\`/g')"
-KEY_HINT_ESCAPED="$(printf '%s' "$UNLOCK_KEY_HINT" | sed 's/"/'"'"'/g')"
-
-format_elapsed() {
-  now_ts="$(date +%s)"
-  elapsed=$((now_ts - START_TS))
-  mins=$((elapsed / 60))
-  secs=$((elapsed % 60))
-  printf '%d分%d秒' "$mins" "$secs"
+json_escape() {
+  printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'
 }
 
-edit_timeout_message() {
-  if [ -z "${MESSAGE_ID:-}" ]; then
-    return 0
-  fi
-  elapsed_text="$(format_elapsed)"
-  curl -sS -X POST "https://api.telegram.org/bot${BOT_TOKEN}/editMessageText" \
-    -H "Content-Type: application/json" \
-    -d "{\"chat_id\":\"${CHAT_ID}\",\"message_id\":${MESSAGE_ID},\"parse_mode\":\"Markdown\",\"text\":\"🔑 GPG 调用审批\\n\\n调用信息: \\\`${CMD_DISPLAY_MD}\\\`\\n\\n⏱️ ${elapsed_text} 已拒绝（超时）\"}" >/dev/null || true
+cmd_escaped="$(json_escape "$CMD_DISPLAY")"
+key_hint_escaped="$(json_escape "$UNLOCK_KEY_HINT")"
+request_json="{\"kind\":\"gpg\",\"cmd\":\"${cmd_escaped}\",\"timeout_seconds\":${TIMEOUT},\"key_hint\":\"${key_hint_escaped}\"}"
+
+resp="$(curl -sS --unix-socket "$APPROVAL_SOCKET" -X POST http://localhost/v1/request -H "Content-Type: application/json" -d "$request_json")" || {
+  echo "[gpg-ask] 创建审批请求失败" >&2
+  exit 1
 }
 
-edit_final_message() {
-  final_status="$1"
-  if [ -z "${MESSAGE_ID:-}" ]; then
-    return 0
-  fi
-  curl -sS -X POST "https://api.telegram.org/bot${BOT_TOKEN}/editMessageText" \
-    -H "Content-Type: application/json" \
-    -d "{\"chat_id\":\"${CHAT_ID}\",\"message_id\":${MESSAGE_ID},\"parse_mode\":\"Markdown\",\"text\":\"🔑 GPG 调用审批\\n\\n调用信息: \\\`${CMD_DISPLAY_MD}\\\`\\n\\n${final_status}\"}" >/dev/null || true
-}
-
-run_gpg_once() {
-  tmp_err="$(mktemp)"
-  if /usr/bin/gpg "$@" 2>"$tmp_err"; then
-    rm -f "$tmp_err"
-    return 0
-  fi
-  cat "$tmp_err" >&2
-  gpg_err="$(cat "$tmp_err")"
-  rm -f "$tmp_err"
-  return 1
-}
-
-needs_unlock() {
-  echo "$gpg_err" | grep -Eqi 'No pinentry|Bad passphrase|Inappropriate ioctl|No secret key|decryption failed|signing failed'
-}
-
-create_unlock_request() {
-  cat > "$UNLOCK_REQ_FILE" <<JSON
-{"request_id":"$REQUEST_ID","cmd":"$CMD_DISPLAY_ESCAPED","key_hint":"$KEY_HINT_ESCAPED","created_at":$(date +%s),"message_id":${MESSAGE_ID:-0}}
-JSON
-}
-
-SEND_RESP="$(curl -sS -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
-  -H "Content-Type: application/json" \
-  -d "{\"chat_id\":\"${CHAT_ID}\",\"parse_mode\":\"Markdown\",\"text\":\"🔑 GPG 调用审批\\n\\n调用信息: \\\`${CMD_DISPLAY_MD}\\\`\\n\\n请在 ${TIMEOUT} 秒内审批\",\"reply_markup\":{\"inline_keyboard\":[[{\"text\":\"✅ 允许\",\"callback_data\":\"approve:${REQUEST_ID}\"},{\"text\":\"❌ 拒绝\",\"callback_data\":\"deny:${REQUEST_ID}\"}]]}}")"
-MESSAGE_ID="$(printf '%s' "$SEND_RESP" | sed -n 's/.*"message_id":\([0-9][0-9]*\).*/\1/p' | head -n 1)"
-log "request_id=${REQUEST_ID} sendMessage response=${SEND_RESP}"
-if [ -z "$MESSAGE_ID" ]; then
-  log "request_id=${REQUEST_ID} 未解析到 message_id，直接拒绝"
+request_id="$(printf '%s' "$resp" | sed -n 's/.*"request_id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n 1)"
+if [ -z "$request_id" ]; then
+  echo "[gpg-ask] 无法解析 request_id" >&2
   exit 1
 fi
-log "request_id=${REQUEST_ID} message_id=${MESSAGE_ID} 已发送审批消息"
 
-i=0
-while [ "$i" -lt "$TIMEOUT" ]; do
-  if [ -f "$RESPONSE_FILE" ]; then
-    RESPONSE="$(cat "$RESPONSE_FILE")"
-    rm -f "$RESPONSE_FILE"
-    log "request_id=${REQUEST_ID} 收到审批结果=${RESPONSE}"
-    if [ "$RESPONSE" = "approve" ]; then
-      log "request_id=${REQUEST_ID} 已授权，进入 PENDING 等待密码"
-      create_unlock_request
-      j=0
-      while [ "$j" -lt "$TIMEOUT" ]; do
-        if [ -f "$UNLOCK_RESULT_FILE" ]; then
-          UNLOCK_RESULT="$(cat "$UNLOCK_RESULT_FILE")"
-          rm -f "$UNLOCK_RESULT_FILE" "$UNLOCK_REQ_FILE" "$UNLOCK_REQ_FILE.sent" || true
-          log "request_id=${REQUEST_ID} 收到解锁结果=${UNLOCK_RESULT}"
-          if [ "$UNLOCK_RESULT" = "unlocked" ]; then
-            log "request_id=${REQUEST_ID} 解锁成功，开始签名"
-            if run_gpg_once "$@"; then
-              log "request_id=${REQUEST_ID} 解锁后重试成功"
-              edit_final_message "✅ 已成功"
-              exit 0
-            fi
-            log "request_id=${REQUEST_ID} 解锁后签名失败"
-            edit_final_message "❌ 已失败（签名执行失败）"
-            exit 1
-          fi
-          log "request_id=${REQUEST_ID} 解锁被拒绝或失败"
-          edit_final_message "❌ 已失败（密码验证失败）"
-          exit 1
-        fi
-        j=$((j + 1))
-        sleep 1
-      done
-      log "request_id=${REQUEST_ID} 等待解锁超时"
-      edit_final_message "⏱️ 超时失败（未输入密码）"
-      rm -f "$UNLOCK_REQ_FILE" "$UNLOCK_REQ_FILE.sent" || true
-      exit 1
-    fi
-    log "request_id=${REQUEST_ID} 已拒绝"
-    exit 1
-  fi
-  i=$((i + 1))
-  sleep 1
-done
+wait_timeout=$((TIMEOUT + 30))
+wait_json="{\"request_id\":\"${request_id}\",\"timeout_seconds\":${wait_timeout}}"
+wait_resp="$(curl -sS --unix-socket "$APPROVAL_SOCKET" -X POST http://localhost/v1/wait -H "Content-Type: application/json" -d "$wait_json")" || {
+  echo "[gpg-ask] 等待审批结果失败" >&2
+  exit 1
+}
 
-log "request_id=${REQUEST_ID} 审批超时"
-edit_timeout_message
+status="$(printf '%s' "$wait_resp" | sed -n 's/.*"status"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n 1)"
+
+if [ "$status" = "approved" ]; then
+  exec /usr/bin/gpg "$@"
+fi
+
+if [ "$status" = "denied" ]; then
+  echo "[gpg-ask] 已拒绝" >&2
+  exit 1
+fi
+
+if [ "$status" = "timeout" ] || [ "$status" = "wait_timeout" ]; then
+  echo "[gpg-ask] 审批超时" >&2
+  exit 1
+fi
+
+echo "[gpg-ask] 未知审批状态: ${status:-<empty>}" >&2
 exit 1
