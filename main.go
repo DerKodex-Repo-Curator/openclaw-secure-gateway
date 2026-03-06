@@ -67,7 +67,7 @@ type rpcWaitBody struct {
 
 type approvalReq struct {
 	ID        string
-	Kind      string // gpg | ssh
+	Kind      string // gpg | ssh | sudo
 	Cmd       string
 	KeyHint   string
 	CreatedAt time.Time
@@ -84,10 +84,17 @@ type approvalReq struct {
 type approvalManager struct {
 	mu       sync.RWMutex
 	requests map[string]*approvalReq
+	grantMu  sync.Mutex
+	grants   map[string]time.Time
+	grantTTL map[string]time.Duration
 }
 
 func newManager() *approvalManager {
-	return &approvalManager{requests: make(map[string]*approvalReq)}
+	return &approvalManager{
+		requests: make(map[string]*approvalReq),
+		grants:   make(map[string]time.Time),
+		grantTTL: make(map[string]time.Duration),
+	}
 }
 
 func (m *approvalManager) add(r *approvalReq) {
@@ -122,6 +129,44 @@ func (m *approvalManager) latestPendingPassword() *approvalReq {
 		return list[i].CreatedAt.After(list[j].CreatedAt)
 	})
 	return list[0]
+}
+
+func (m *approvalManager) setGrantTTL(kind string, seconds int) {
+	m.grantMu.Lock()
+	defer m.grantMu.Unlock()
+	if seconds <= 0 {
+		m.grantTTL[kind] = 0
+		return
+	}
+	m.grantTTL[kind] = time.Duration(seconds) * time.Second
+}
+
+func (m *approvalManager) hasValidGrant(kind string) bool {
+	m.grantMu.Lock()
+	defer m.grantMu.Unlock()
+	ttl, ok := m.grantTTL[kind]
+	if !ok || ttl <= 0 {
+		return false
+	}
+	expireAt, ok := m.grants[kind]
+	if !ok {
+		return false
+	}
+	if time.Now().After(expireAt) {
+		delete(m.grants, kind)
+		return false
+	}
+	return true
+}
+
+func (m *approvalManager) rememberGrant(kind string) {
+	m.grantMu.Lock()
+	defer m.grantMu.Unlock()
+	ttl, ok := m.grantTTL[kind]
+	if !ok || ttl <= 0 {
+		return
+	}
+	m.grants[kind] = time.Now().Add(ttl)
 }
 
 func (r *approvalReq) transition(to string) bool {
@@ -164,6 +209,9 @@ func main() {
 
 	baseURL := "https://api.telegram.org/bot" + token
 	mgr := newManager()
+	mgr.setGrantTTL("ssh", envInt("SSH_APPROVAL_CACHE_SECONDS", 1800))
+	mgr.setGrantTTL("gpg", envInt("GPG_APPROVAL_CACHE_SECONDS", 1800))
+	mgr.setGrantTTL("sudo", envInt("SUDO_APPROVAL_CACHE_SECONDS", 0))
 
 	go runRPCServer(socketPath, baseURL, allowedChatID, mgr)
 	log.Printf("gpg-approval-bot 启动，socket=%s", socketPath)
@@ -211,8 +259,8 @@ func runRPCServer(socketPath, baseURL string, allowedChatID int64, mgr *approval
 			return
 		}
 		kind := strings.TrimSpace(body.Kind)
-		if kind != "gpg" && kind != "ssh" {
-			http.Error(w, "kind must be gpg or ssh", http.StatusBadRequest)
+		if kind != "gpg" && kind != "ssh" && kind != "sudo" {
+			http.Error(w, "kind must be gpg or ssh or sudo", http.StatusBadRequest)
 			return
 		}
 		cmd := strings.TrimSpace(body.Cmd)
@@ -223,6 +271,25 @@ func runRPCServer(socketPath, baseURL string, allowedChatID int64, mgr *approval
 		timeout := body.TimeoutSecond
 		if timeout <= 0 {
 			timeout = 60
+		}
+		if mgr.hasValidGrant(kind) {
+			reqID := shortID(kind)
+			req := &approvalReq{
+				ID:        reqID,
+				Kind:      kind,
+				Cmd:       cmd,
+				KeyHint:   strings.TrimSpace(body.KeyHint),
+				CreatedAt: time.Now(),
+				Deadline:  time.Now(),
+				state:     "approved",
+				done:      make(chan string, 1),
+				finalized: true,
+			}
+			close(req.done)
+			mgr.add(req)
+			log.Printf("命中审批缓存 id=%s kind=%s", req.ID, req.Kind)
+			writeJSON(w, map[string]any{"request_id": reqID, "cached": true})
+			return
 		}
 
 		reqID := shortID(kind)
@@ -330,6 +397,9 @@ func sendApprovalMessage(baseURL string, chatID int64, req *approvalReq, timeout
 	if req.Kind == "ssh" {
 		emoji = "🔐"
 		title = "SSH"
+	} else if req.Kind == "sudo" {
+		emoji = "🛡️"
+		title = "SUDO"
 	}
 	cmdMD := strings.ReplaceAll(req.Cmd, "`", "\\`")
 	text := fmt.Sprintf("%s %s 调用审批\n\n调用信息: `%s`\n\n请在 %d 秒内审批", emoji, title, cmdMD, timeout)
@@ -398,8 +468,9 @@ func handleCallback(baseURL string, cb *CallbackQuery, allowedChatID int64, mgr 
 		return fmt.Errorf("未知 action: %s", action)
 	}
 
-	if req.Kind == "ssh" {
+	if req.Kind == "ssh" || req.Kind == "sudo" {
 		if req.transition("approved") {
+			mgr.rememberGrant(req.Kind)
 			_ = editStatusMessage(baseURL, allowedChatID, req.MessageID, req.Cmd, "✅ 已批准")
 		}
 		_ = postJSON(baseURL+"/answerCallbackQuery", map[string]any{"callback_query_id": cb.ID, "text": "✅ 已批准"})
@@ -455,6 +526,7 @@ func handleMessage(baseURL string, msg *TGMessage, allowedChatID int64, mgr *app
 		return nil
 	}
 	if req.transition("approved") {
+		mgr.rememberGrant(req.Kind)
 		_ = editStatusMessage(baseURL, allowedChatID, req.MessageID, req.Cmd, "✅ 已成功")
 	}
 	_ = deletePendingPromptMessage(baseURL, allowedChatID, req)
@@ -524,6 +596,8 @@ func editStatusMessage(baseURL string, chatID, messageID int64, cmd, status stri
 	prefix := "🔑 GPG 调用审批"
 	if strings.HasPrefix(cmd, "ssh ") {
 		prefix = "🔐 SSH 调用审批"
+	} else if strings.HasPrefix(cmd, "sudo ") {
+		prefix = "🛡️ SUDO 调用审批"
 	}
 	text = prefix + "\n\n" + text
 	return postJSON(baseURL+"/editMessageText", map[string]any{
@@ -641,4 +715,17 @@ func shortID(prefix string) string {
 		return "ssh-" + id
 	}
 	return id
+}
+
+func envInt(name string, defaultValue int) int {
+	raw := strings.TrimSpace(os.Getenv(name))
+	if raw == "" {
+		return defaultValue
+	}
+	v, err := strconv.Atoi(raw)
+	if err != nil {
+		log.Printf("环境变量 %s 不是整数，使用默认值 %d", name, defaultValue)
+		return defaultValue
+	}
+	return v
 }

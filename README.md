@@ -20,8 +20,10 @@
 ## 环境变量
 - `GPG_APPROVAL_BOT_TOKEN`：审批 bot token
 - `GPG_APPROVAL_CHAT_ID`：允许交互的 chat id
-- `APPROVAL_DIR`：审批状态文件目录（默认 `/approvals`）
-- `GPG_APPROVAL_TIMEOUT`：超时时间（秒，默认 60）
+- `APPROVAL_SOCKET`：Unix Socket 路径（默认 `/run/approval-rpc/approval.sock`）
+- `GPG_APPROVAL_TIMEOUT`：单次审批超时时间（秒，默认 60）
+- `SSH_APPROVAL_CACHE_SECONDS`：SSH 审批缓存秒数（默认 1800，设为 `0` 表示每次都审批）
+- `GPG_APPROVAL_CACHE_SECONDS`：GPG 审批缓存秒数（默认 1800，设为 `0` 表示每次都审批）
 - `GPG_UNLOCK_KEY_HINT`：可选，解锁 key 提示
 
 ## 独立启动
