@@ -6,8 +6,11 @@
 - 接收审批请求（允许/拒绝按钮）
 - 审批通过后进入密码输入阶段（PENDING）
 - 用户发送密码后自动删除消息并尝试解锁
+- **密码缓存**：解锁成功后使用 `PRESET_PASSPHRASE` 将密码预设到 GPG agent 缓存
+- **智能检测**：SSH 操作前检查密钥缓存状态，避免不必要的重复解锁
 - 成功后写回 `unlocked`，供 wrapper 继续执行真实命令
 - 超时/拒绝时写回失败状态
+- **审批缓存**：相同操作在缓存时间内无需重复审批
 
 ## 目录
 - `main.go`：Bot 主程序
@@ -59,7 +62,55 @@ services:
       - ${HOST_GPG_AGENT_DIR}/S.gpg-agent.ssh:${BOT_GNUPG_DIR}/S.gpg-agent.ssh
 ```
 
+## 技术细节
+
+### GPG 密码缓存机制
+
+解锁流程分为两步：
+
+1. **密码验证**：使用 `gpg --pinentry-mode loopback --passphrase <password> --sign` 验证密码正确性
+2. **密码预设**：验证成功后，使用 `gpg-connect-agent PRESET_PASSPHRASE` 将密码预设到 GPG agent 缓存
+
+这样做的好处：
+- SSH 认证子密钥 `[A]` 和 GPG 签名子密钥 `[S]` 共享主密钥密码，但在 GPG agent 中有独立的缓存状态
+- 单纯的 `gpg --sign` 只会缓存签名子密钥的密码，不会缓存认证子密钥的密码
+- 使用 `PRESET_PASSPHRASE` 可以一次性预设所有子密钥（包括认证子密钥）的密码到缓存
+
+### SSH 密钥缓存检测
+
+`scripts/ssh-ask` 在审批通过后会检查 GPG agent 中的 SSH 密钥缓存状态：
+
+```bash
+gpg-connect-agent "keyinfo --ssh-list" /bye
+```
+
+输出格式：`S KEYINFO <keygrip> D - - <cached> P - <ttl> S`
+
+- 第 7 列为 `1` 表示密钥已缓存，可以直接使用
+- 第 7 列为 `-` 表示密钥未缓存，需要触发解锁流程
+
+### GPG Agent 配置要求
+
+为了使用 `PRESET_PASSPHRASE` 功能，需要在 `~/.gnupg/gpg-agent.conf` 中添加：
+
+```
+allow-preset-passphrase
+```
+
+修改后需要重启 GPG agent：
+
+```bash
+gpgconf --kill gpg-agent
+```
+
 ## 安全约束
-- 不在日志中打印密码。
-- 不回显用户提交的密码内容。
-- 用户发送内容应尽快删除。
+
+**严格禁止在日志中记录密码或可能包含密码的内容**：
+
+- ❌ 不在日志中打印密码明文
+- ❌ 不在日志中打印密码的十六进制编码
+- ❌ 不在日志中打印包含密码的命令行参数
+- ❌ 不回显用户提交的密码内容
+- ✅ 用户发送的密码消息立即删除
+- ✅ 密码通过 stdin 传递给子进程，不出现在进程列表中
+- ✅ 日志只记录操作结果（成功/失败），不记录密码相关内容

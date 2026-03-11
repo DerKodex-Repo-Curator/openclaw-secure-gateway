@@ -6,7 +6,9 @@ RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags='-s -w' -o
 FROM alpine:3.20
 RUN apk add --no-cache gnupg
 RUN adduser -D -u 1000 bot
-USER bot
 WORKDIR /app
-COPY --from=build /out/gpg-approval-bot /usr/local/bin/gpg-approval-bot
-ENTRYPOINT ["/usr/local/bin/gpg-approval-bot"]
+COPY --from=build /out/gpg-approval-bot /app/gpg-approval-bot
+COPY --chown=bot:bot gpg-approval-bot/scripts/entrypoint.sh /app/entrypoint.sh
+RUN chmod +x /app/entrypoint.sh
+USER bot
+ENTRYPOINT ["/app/entrypoint.sh"]

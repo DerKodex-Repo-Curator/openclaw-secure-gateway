@@ -33,6 +33,50 @@ wait_resp="$(curl -sS --unix-socket "$APPROVAL_SOCKET" -X POST http://localhost/
 status="$(printf '%s' "$wait_resp" | sed -n 's/.*"status"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n 1)"
 
 if [ "$status" = "approved" ]; then
+  # 检测 GPG agent 中的 SSH 密钥是否被锁定（检查缓存状态）
+  # keyinfo --ssh-list 输出格式：S KEYINFO <keygrip> D - - <cached> P - <ttl> S
+  # 第7列为 '1' 表示已缓存，为 '-' 表示未缓存
+  key_cached="$(gpg-connect-agent "keyinfo --ssh-list" /bye 2>/dev/null | grep "^S KEYINFO" | awk '{if ($7 == "1") print "cached"}' | head -n 1)"
+  if [ -z "$key_cached" ]; then
+    echo "[ssh-ask] GPG agent 中的 SSH 密钥被锁定，触发解锁流程" >&2
+
+    # 获取 SSH 密钥对应的 GPG 密钥 ID（用于 --local-user）
+    # 从 keyinfo --ssh-list 获取第一个 keygrip，然后查找对应的主密钥
+    keygrip="$(gpg-connect-agent "keyinfo --ssh-list" /bye 2>/dev/null | grep "^S KEYINFO" | head -n 1 | awk '{print $3}')"
+    key_hint=""
+    if [ -n "$keygrip" ]; then
+      # 通过 keygrip 查找对应的密钥 ID
+      key_hint="$(gpg --with-keygrip --list-secret-keys 2>/dev/null | grep -B 5 "$keygrip" | grep "^sec" | head -n 1 | awk '{print $2}' | cut -d'/' -f2)"
+    fi
+
+    # 构造解锁请求 JSON（包含 key_hint）
+    if [ -n "$key_hint" ]; then
+      key_hint_escaped="$(json_escape "$key_hint")"
+      unlock_json="{\"kind\":\"gpg_unlock_for_ssh\",\"cmd\":\"${cmd_escaped}\",\"key_hint\":\"${key_hint_escaped}\",\"timeout_seconds\":${TIMEOUT}}"
+    else
+      unlock_json="{\"kind\":\"gpg_unlock_for_ssh\",\"cmd\":\"${cmd_escaped}\",\"timeout_seconds\":${TIMEOUT}}"
+    fi
+
+    unlock_resp="$(curl -sS --unix-socket "$APPROVAL_SOCKET" -X POST http://localhost/v1/request -H "Content-Type: application/json" -d "$unlock_json")" || {
+      echo "[ssh-ask] 创建 GPG 解锁请求失败" >&2
+      exit 1
+    }
+    unlock_id="$(printf '%s' "$unlock_resp" | sed -n 's/.*"request_id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n 1)"
+    if [ -z "$unlock_id" ]; then
+      echo "[ssh-ask] 无法解析 unlock request_id" >&2
+      exit 1
+    fi
+    unlock_wait_json="{\"request_id\":\"${unlock_id}\",\"timeout_seconds\":${wait_timeout}}"
+    unlock_wait_resp="$(curl -sS --unix-socket "$APPROVAL_SOCKET" -X POST http://localhost/v1/wait -H "Content-Type: application/json" -d "$unlock_wait_json")" || {
+      echo "[ssh-ask] 等待 GPG 解锁失败" >&2
+      exit 1
+    }
+    unlock_status="$(printf '%s' "$unlock_wait_resp" | sed -n 's/.*"status"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n 1)"
+    if [ "$unlock_status" != "approved" ]; then
+      echo "[ssh-ask] GPG 解锁失败: ${unlock_status}" >&2
+      exit 1
+    fi
+  fi
   exec /usr/bin/ssh "$@"
 fi
 

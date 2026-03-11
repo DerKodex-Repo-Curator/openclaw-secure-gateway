@@ -259,8 +259,8 @@ func runRPCServer(socketPath, baseURL string, allowedChatID int64, mgr *approval
 			return
 		}
 		kind := strings.TrimSpace(body.Kind)
-		if kind != "gpg" && kind != "ssh" && kind != "sudo" {
-			http.Error(w, "kind must be gpg or ssh or sudo", http.StatusBadRequest)
+		if kind != "gpg" && kind != "ssh" && kind != "sudo" && kind != "gpg_unlock_for_ssh" {
+			http.Error(w, "kind must be gpg or ssh or sudo or gpg_unlock_for_ssh", http.StatusBadRequest)
 			return
 		}
 		cmd := strings.TrimSpace(body.Cmd)
@@ -288,6 +288,7 @@ func runRPCServer(socketPath, baseURL string, allowedChatID int64, mgr *approval
 			close(req.done)
 			mgr.add(req)
 			log.Printf("命中审批缓存 id=%s kind=%s", req.ID, req.Kind)
+			_ = sendCachedNotification(baseURL, allowedChatID, req)
 			writeJSON(w, map[string]any{"request_id": reqID, "cached": true})
 			return
 		}
@@ -391,6 +392,28 @@ func runRPCServer(socketPath, baseURL string, allowedChatID int64, mgr *approval
 	}
 }
 
+func sendCachedNotification(baseURL string, chatID int64, req *approvalReq) error {
+	emoji := "🔑"
+	title := "GPG"
+	if req.Kind == "ssh" {
+		emoji = "🔐"
+		title = "SSH"
+	} else if req.Kind == "sudo" {
+		emoji = "🛡️"
+		title = "SUDO"
+	} else if req.Kind == "gpg_unlock_for_ssh" {
+		emoji = "🔓"
+		title = "GPG 解锁（SSH 需要）"
+	}
+	cmdMD := strings.ReplaceAll(req.Cmd, "`", "\\`")
+	text := fmt.Sprintf("✅ %s %s 已成功（已缓存）\n\n调用信息: `%s`", emoji, title, cmdMD)
+	return postJSON(baseURL+"/sendMessage", map[string]any{
+		"chat_id":    chatID,
+		"parse_mode": "Markdown",
+		"text":       text,
+	})
+}
+
 func sendApprovalMessage(baseURL string, chatID int64, req *approvalReq, timeout int) (int64, error) {
 	emoji := "🔑"
 	title := "GPG"
@@ -400,6 +423,9 @@ func sendApprovalMessage(baseURL string, chatID int64, req *approvalReq, timeout
 	} else if req.Kind == "sudo" {
 		emoji = "🛡️"
 		title = "SUDO"
+	} else if req.Kind == "gpg_unlock_for_ssh" {
+		emoji = "🔓"
+		title = "GPG 解锁（SSH 需要）"
 	}
 	cmdMD := strings.ReplaceAll(req.Cmd, "`", "\\`")
 	text := fmt.Sprintf("%s %s 调用审批\n\n调用信息: `%s`\n\n请在 %d 秒内审批", emoji, title, cmdMD, timeout)
@@ -470,8 +496,37 @@ func handleCallback(baseURL string, cb *CallbackQuery, allowedChatID int64, mgr 
 
 	if req.Kind == "ssh" || req.Kind == "sudo" {
 		if req.transition("approved") {
-			mgr.rememberGrant(req.Kind)
+			// 注意：SSH 审批不立即记录缓存，需要等待后续的 GPG 解锁成功
+			// 只有 sudo 立即记录缓存
+			if req.Kind == "sudo" {
+				mgr.rememberGrant(req.Kind)
+			}
 			_ = editStatusMessage(baseURL, allowedChatID, req.MessageID, req.Cmd, "✅ 已批准")
+		}
+		_ = postJSON(baseURL+"/answerCallbackQuery", map[string]any{"callback_query_id": cb.ID, "text": "✅ 已批准"})
+		return nil
+	}
+
+	if req.Kind == "gpg_unlock_for_ssh" {
+		req.mu.Lock()
+		if req.finalized {
+			req.mu.Unlock()
+			return nil
+		}
+		req.state = "waiting_password"
+		req.mu.Unlock()
+		status := "🟡 已批准，需要密码解锁 GPG agent（用于 SSH）\n请输入密码（发送后自动删除）"
+		if req.KeyHint != "" {
+			status += fmt.Sprintf("\n密钥提示: %s", req.KeyHint)
+		}
+		_ = editStatusMessage(baseURL, allowedChatID, req.MessageID, req.Cmd, status)
+		promptID, err := sendPendingPromptMessage(baseURL, allowedChatID)
+		if err != nil {
+			log.Printf("发送 PENDING 提示失败 request_id=%s err=%v", req.ID, err)
+		} else {
+			req.mu.Lock()
+			req.PromptID = promptID
+			req.mu.Unlock()
 		}
 		_ = postJSON(baseURL+"/answerCallbackQuery", map[string]any{"callback_query_id": cb.ID, "text": "✅ 已批准"})
 		return nil
@@ -505,17 +560,48 @@ func handleMessage(baseURL string, msg *TGMessage, allowedChatID int64, mgr *app
 	if msg.Chat.ID != allowedChatID {
 		return nil
 	}
+
+	text := strings.TrimSpace(msg.Text)
+	if text == "" {
+		return nil
+	}
+
+	// 命令处理
+	if strings.HasPrefix(text, "/lock") {
+		log.Printf("收到命令: /lock")
+
+		err := handleLockCommand(baseURL, allowedChatID, mgr)
+		_ = deleteMessage(baseURL, msg.Chat.ID, msg.MessageID)
+		return err
+	}
+
+	if strings.HasPrefix(text, "/unlock") {
+		log.Printf("收到命令: /unlock")
+		parts := strings.Fields(text)
+		keyHint := ""
+		if len(parts) > 1 {
+			keyHint = parts[1]
+		}
+		err := handleUnlockCommand(baseURL, allowedChatID, mgr, keyHint)
+		_ = deleteMessage(baseURL, msg.Chat.ID, msg.MessageID)
+		return err
+	}
+
+	// 密码处理：只有在有待处理的密码请求时才处理
+	req := mgr.latestPendingPassword()
+
+	// 无论是否有待处理请求，都要删除来自授权聊天的消息（可能是晚到的密码）
 	defer func() { _ = deleteMessage(baseURL, msg.Chat.ID, msg.MessageID) }()
 
-	passphrase := msg.Text
-	if strings.TrimSpace(passphrase) == "" {
+	if req == nil {
+		// 没有待处理的密码请求，忽略此消息
+		log.Printf("收到非命令消息但无待处理密码请求，忽略")
 		return nil
 	}
 
-	req := mgr.latestPendingPassword()
-	if req == nil {
-		return nil
-	}
+	// 确认是密码输入，记录日志但不打印密码内容
+	log.Printf("收到密码输入，尝试解锁 request_id=%s", req.ID)
+	passphrase := text
 
 	ok, err := unlockKey(passphrase, req.KeyHint)
 	if !ok {
@@ -526,11 +612,100 @@ func handleMessage(baseURL string, msg *TGMessage, allowedChatID int64, mgr *app
 		return nil
 	}
 	if req.transition("approved") {
-		mgr.rememberGrant(req.Kind)
+		// manual_unlock 不记录缓存
+		if req.Kind != "manual_unlock" {
+			// gpg_unlock_for_ssh 解锁成功后，记录 ssh 审批缓存
+			if req.Kind == "gpg_unlock_for_ssh" {
+				mgr.rememberGrant("ssh")
+			} else {
+				mgr.rememberGrant(req.Kind)
+			}
+		}
 		_ = editStatusMessage(baseURL, allowedChatID, req.MessageID, req.Cmd, "✅ 已成功")
 	}
 	_ = deletePendingPromptMessage(baseURL, allowedChatID, req)
 	log.Printf("解锁成功 request_id=%s", req.ID)
+	return nil
+}
+
+func handleLockCommand(baseURL string, chatID int64, mgr *approvalManager) error {
+	log.Printf("执行 /lock 命令")
+
+	// 清空 bot 缓存
+	mgr.grantMu.Lock()
+	mgr.grants = make(map[string]time.Time)
+	mgr.grantMu.Unlock()
+
+	// 锁定 GPG agent
+	cmd := exec.Command("gpg-connect-agent", "reloadagent", "/bye")
+	if err := cmd.Run(); err != nil {
+		log.Printf("锁定 GPG agent 失败: %v", err)
+		err2 := postJSON(baseURL+"/sendMessage", map[string]any{
+			"chat_id": chatID,
+			"text":    "🔒 锁定失败：" + err.Error(),
+		})
+		if err2 != nil {
+			log.Printf("发送失败消息失败: %v", err2)
+		}
+		return err
+	}
+
+	log.Printf("手动锁定 GPG agent 成功")
+	err := postJSON(baseURL+"/sendMessage", map[string]any{
+		"chat_id": chatID,
+		"text":    "🔒 GPG agent 已锁定，所有缓存已清空",
+	})
+	if err != nil {
+		log.Printf("发送成功消息失败: %v", err)
+	}
+	return err
+}
+
+func handleUnlockCommand(baseURL string, chatID int64, mgr *approvalManager, keyHint string) error {
+	reqID := shortID("manual")
+	req := &approvalReq{
+		ID:        reqID,
+		Kind:      "manual_unlock",
+		Cmd:       "/unlock " + keyHint,
+		KeyHint:   keyHint,
+		CreatedAt: time.Now(),
+		Deadline:  time.Now().Add(300 * time.Second),
+		state:     "waiting_password",
+		done:      make(chan string, 1),
+	}
+	mgr.add(req)
+
+	text := "🔓 手动解锁 GPG agent\n\n请输入密码（发送后自动删除）"
+	if keyHint != "" {
+		text += fmt.Sprintf("\n密钥提示: %s", keyHint)
+	}
+	respBody, err := postJSONRead(baseURL+"/sendMessage", map[string]any{
+		"chat_id":    chatID,
+		"parse_mode": "Markdown",
+		"text":       text,
+	})
+	if err != nil {
+		return err
+	}
+	var parsed tgSendMessageResp
+	if err := json.Unmarshal(respBody, &parsed); err != nil {
+		return err
+	}
+	if parsed.OK && parsed.Result.MessageID > 0 {
+		req.mu.Lock()
+		req.MessageID = parsed.Result.MessageID
+		req.mu.Unlock()
+	}
+
+	promptID, err := sendPendingPromptMessage(baseURL, chatID)
+	if err != nil {
+		return err
+	}
+	req.mu.Lock()
+	req.PromptID = promptID
+	req.mu.Unlock()
+
+	log.Printf("手动解锁请求 id=%s key_hint=%s", reqID, keyHint)
 	return nil
 }
 
@@ -565,6 +740,7 @@ func getUpdates(baseURL string, offset int64) ([]Update, int64, error) {
 }
 
 func unlockKey(passphrase, keyHint string) (bool, error) {
+	// 第一步：验证密码正确性（使用 gpg --sign）
 	probe, err := os.CreateTemp("", "gpg-unlock-probe-*.txt")
 	if err != nil {
 		return false, err
@@ -587,6 +763,65 @@ func unlockKey(passphrase, keyHint string) (bool, error) {
 	if err != nil {
 		return false, fmt.Errorf("gpg 解锁失败: %s", strings.TrimSpace(string(out)))
 	}
+
+	// 第二步：将密码预设到 GPG agent 缓存
+	// 获取目标密钥的所有 keygrip（主密钥和所有子密钥）
+	var keyInfoCmd *exec.Cmd
+	if strings.TrimSpace(keyHint) != "" {
+		// 如果指定了 key_hint，只获取该密钥的 keygrip
+		keyInfoCmd = exec.Command("gpg", "--with-keygrip", "--list-secret-keys", keyHint)
+	} else {
+		// 否则获取默认密钥的 keygrip
+		keyInfoCmd = exec.Command("gpg", "--with-keygrip", "--list-secret-keys")
+	}
+	keyInfoOut, err := keyInfoCmd.CombinedOutput()
+	if err != nil {
+		log.Printf("警告：无法获取密钥列表: %v", err)
+		return true, nil // 密码验证已成功，继续
+	}
+
+	// 从 gpg --with-keygrip 输出中提取 keygrip
+	// 格式：
+	//   sec   rsa4096/KEYID ...
+	//         Keygrip = XXXXXXXX...
+	//   ssb   rsa4096/KEYID ...
+	//         Keygrip = YYYYYYYY...
+	var keygrips []string
+	lines := strings.Split(string(keyInfoOut), "\n")
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "Keygrip = ") {
+			keygrip := strings.TrimPrefix(trimmed, "Keygrip = ")
+			keygrips = append(keygrips, keygrip)
+		}
+	}
+
+	if len(keygrips) == 0 {
+		log.Printf("警告：未找到目标密钥的 keygrip")
+		return true, nil
+	}
+
+	// 将密码转换为十六进制（PRESET_PASSPHRASE 要求）
+	hexPass := fmt.Sprintf("%X", []byte(passphrase))
+
+	// 预设目标密钥的所有 keygrip
+	presetCount := 0
+	for _, keygrip := range keygrips {
+		// 使用 PRESET_PASSPHRASE 命令：PRESET_PASSPHRASE <keygrip> <timeout> <hexstring>
+		// timeout -1 表示使用默认缓存时间
+		presetCmd := exec.Command("gpg-connect-agent")
+		presetCmd.Stdin = strings.NewReader(fmt.Sprintf("PRESET_PASSPHRASE %s -1 %s\n/bye\n", keygrip, hexPass))
+		if err := presetCmd.Run(); err == nil {
+			presetCount++
+		}
+	}
+
+	if presetCount > 0 {
+		log.Printf("已预设 %d 个密钥的密码到 GPG agent 缓存", presetCount)
+	} else {
+		log.Printf("警告：未能预设密码到 GPG agent（可能需要在 gpg-agent.conf 中启用 allow-preset-passphrase）")
+	}
+
 	return true, nil
 }
 
